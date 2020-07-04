@@ -2,15 +2,21 @@
 #include <M5StickC.h>
 #include <MIDI.h>
 #include <stdio.h> 
-
+#include <math.h>
 
 // Headers for ESP32 BLE
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
-//#include "BLEScan.h"
 
+// Toggle Using the Serial Monitor
+#define SERIAL_TOGGLE true
+
+// BLE Device Name
+#define DEVICE_NAME "hairy_whistle"
+
+// BLE MIDI Info
 #define SERVICE_UUID        "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
 #define CHARACTERISTIC_UUID "7772e5db-3868-4112-a1a9-f2669d106bf3"
 
@@ -18,8 +24,11 @@ BLECharacteristic *pCharacteristic;
 
 static boolean deviceConnected = false;
 
+// GPIOs for M5Stick-C Buttons
 const int side_button = 39;
 const int front_button = 37;
+
+int sample_count = 0;
 
 float accX = 0;
 float accY = 0;
@@ -28,6 +37,12 @@ float accZ = 0;
 float gyroX = 0;
 float gyroY = 0;
 float gyroZ = 0;
+
+// averaging over gyro readings and feeding that as the velocity (how hard to hit the note in MIDI lingo)
+const int amount_to_avg = 48;
+float gyroArray[amount_to_avg];
+
+int USE_SENSOR = 0; //need to eventually switch to make this easier, but 1 is Accel, 2 is Gyro
 
 uint8_t midiPacket[] = {
    0x80,  // header
@@ -46,21 +61,33 @@ void update_screen(const char* x){
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
+      sample_count = 0;
       update_screen("BLE Connected!");
     };
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
+      char msg[64];
+      strcpy(msg, "BLE Disconnected? Samples Sent: "); /* copy name into the new var */
+      
+      char sc_str[64];
+      sprintf(sc_str, "%d", sample_count);
+      strcat(msg, sc_str);
+
+      update_screen(msg);
     }
 };
 
-
 void setup() {
   M5.begin();
+
+
   Serial.begin(115200); //if before M5 init, seems to not work?
+
+
   M5.MPU6886.Init();
 
-  BLEDevice::init("big buttholes");
+  BLEDevice::init(DEVICE_NAME);
 
   // Create the BLE Server
   BLEServer *pServer = BLEDevice::createServer();
@@ -90,19 +117,20 @@ void setup() {
   pAdvertising->addServiceUUID(pService->getUUID());
   pAdvertising->start();
 
+  // Configure Buttons
   pinMode(side_button, INPUT_PULLUP);
   pinMode(front_button, INPUT);
 
-  // text print
+  // Init the screen
   M5.Lcd.setRotation(3);
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setCursor(0, 10);
   M5.Lcd.setTextColor(WHITE);
   M5.Lcd.setTextSize(1);
-  M5.Lcd.printf("Display Test!");
+  M5.Lcd.printf("guitar_vibe");
+  M5.Lcd.setCursor(0, 30);
+  M5.Lcd.printf("Device Name: %s",DEVICE_NAME);
   delay(500);
-
-  // put your setup code here, to run once:
 }
 
 void loop() {
@@ -141,52 +169,117 @@ void loop() {
   strcat(combined_a, ", ");
   strcat(combined_a, az);
 
-  if (deviceConnected) {
-   // note down
-   midiPacket[2] = 0x90; // note down, channel 0
-   midiPacket[3] = 0x3c; // note down, channel 0
-   midiPacket[4] = 127;  // velocity
-   pCharacteristic->setValue(midiPacket, 5); // packet, length in bytes
-   pCharacteristic->notify();
+  if (deviceConnected) { 
+    sample_count++;
 
-   // play note for 500ms
-   delay(500);
+    // check to see if we are trying to change which sensor to use
+    if (!digitalRead(front_button)){
+        USE_SENSOR = 1;
+    }
+    if (!digitalRead(side_button)){
+        USE_SENSOR = 2;
+    }
 
-   // note up
-   midiPacket[2] = 0x20; // note up, channel 0
-   midiPacket[4] = 0;    // velocity
-   pCharacteristic->setValue(midiPacket, 5); // packet, length in bytes)
-   pCharacteristic->notify();
+    // scale sensors to be within valid note range (0-127) [127 is G8]
+    // accel I'm only using values up to 1G
+    int acc_scaled;
+    if (accX > 1){
+      acc_scaled = 127;
+    }
+    else if (accX < -1){
+      acc_scaled = 127;
+    }
+    else{
+      acc_scaled = abs(ceil(accX * 127));
+    }
 
-   delay(500);
+    // scaling gyro based off how much it has moved in that axis previously
+    int gyro_scaled;
+    for (int i = 1; i<24;i++){
+      gyroArray[i] = gyroArray[i-1];
+    }
+    gyroArray[0]=abs(gyroX); //im lazy and dont want to deal with which direction its moving it, just care how fast
 
-      // note down
-   midiPacket[2] = 0x90; // note down, channel 0
-  //  midiPacket[3] = 0x03; // note down, channel 0
-   midiPacket[3] = 4;
-   midiPacket[4] = 127;  // velocity
-   pCharacteristic->setValue(midiPacket, 5); // packet, length in bytes
-   pCharacteristic->notify();
+    float gyroAvg = 0;
+    float gyroMax = 0;
+    for (int i = 0; i<24;i++){
+      gyroAvg += gyroArray[i];
+      if (gyroArray[i] > gyroMax){
+        gyroMax = gyroArray[i];
+      }
+    }
+    gyroAvg = gyroAvg/24;
 
-   // play note for 500ms
-   delay(500);
+    // lazy
+    // subtracting 1 because this should converge to 1
+    gyro_scaled = abs(ceil( ((gyroMax/gyroAvg)-1) * 127));
+    if (gyro_scaled > 127){
+      gyro_scaled = 127; //im lazy and the max value for velocity in midi is 127. 
+    }
 
-   // note up
-   midiPacket[2] = 0x20; // note up, channel 0
-   midiPacket[4] = 0;    // velocity
-   pCharacteristic->setValue(midiPacket, 5); // packet, length in bytes)
-   pCharacteristic->notify();
+    if (SERIAL_TOGGLE){
+      printf("Acc: %d, Gyro: %d, Gyro Avg: %f, Gyro Max: %f, gyroMax/gyroAvg: %f, gyroX/gyroMax: %f  \r\n",acc_scaled,gyro_scaled,gyroAvg,gyroMax,((gyroMax/gyroAvg)-1),(abs(gyroX)/gyroMax));
+    }
 
-   delay(500);
+    if (USE_SENSOR == 1){
+      // append sample count to screen
+      strcat(combined_a, ". sample: ");
+      char sc_str[64];
+      sprintf(sc_str, "%d", sample_count);
+      strcat(combined_a, sc_str);
+      update_screen(combined_a);
+      midiPacket[3] = acc_scaled; // note
+      midiPacket[4] = gyro_scaled;  // velocity
+    }
+    else if (USE_SENSOR == 2){
+      update_screen(combined_g);
+      midiPacket[3] = gyro_scaled; // note
+      midiPacket[4] = acc_scaled;  // velocity
+      if (SERIAL_TOGGLE){
+        Serial.println("connected, g");
+      }
+    }
+    else{
+      char msg[64];
+      strcpy(msg, "No Sensor, Samples Sent: "); /* copy name into the new var */
+      char sc_str[64];
+      sprintf(sc_str, "%d", sample_count);
+      strcat(msg, sc_str);
+      update_screen(msg);
+      midiPacket[3] = 0x3c; // middle c
+    }
+    
+    // note down
+    midiPacket[2] = 0x90; // note down, channel 0
+    pCharacteristic->setValue(midiPacket, 5); // packet, length in bytes
+    pCharacteristic->notify();
+
+    // play note for 100ms
+    delay(100);
+
+    // note up
+    midiPacket[2] = 0x20; // note up, channel 0
+    midiPacket[4] = 0;    // velocity
+    pCharacteristic->setValue(midiPacket, 5); // packet, length in bytes)
+    pCharacteristic->notify();
+
+    delay(100);
   }
 
-  if (!digitalRead(side_button)){
+  else if (!digitalRead(side_button)){
+    USE_SENSOR = 2;
     update_screen(combined_g);
-    // Serial.println(combined_g);
+    if (SERIAL_TOGGLE){
+      Serial.println("side_button");
+    }
   }
-  if (!digitalRead(front_button)){
+
+  else if (!digitalRead(front_button)){
+    USE_SENSOR = 1;
     update_screen(combined_a);
-    // Serial.println(inc);
+    if (SERIAL_TOGGLE){
+      Serial.println("front_button");
+    }
   }
 
   delay(100);
