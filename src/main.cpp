@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <M5StickC.h>
+#include <driver/i2s.h>
 #include <MIDI.h>
+
 #include <stdio.h> 
 #include <math.h>
 
@@ -10,8 +12,6 @@
 #include <BLEServer.h>
 #include <BLE2902.h>
 
-// Toggle Using the Serial Monitor
-#define SERIAL_TOGGLE true
 
 // BLE Device Name
 #define DEVICE_NAME "hairy_whistle"
@@ -24,10 +24,12 @@ BLECharacteristic *pCharacteristic;
 
 static boolean deviceConnected = false;
 
+
 // GPIOs for M5Stick-C Buttons
 const int side_button = 39;
 const int front_button = 37;
 
+// Accel and Gyro variables
 int sample_count = 0;
 
 float accX = 0;
@@ -44,6 +46,43 @@ float gyroArray[amount_to_avg];
 
 int USE_SENSOR = 0; //need to eventually switch to make this easier, but 1 is Accel, 2 is Gyro
 
+
+// microphone stuff
+#define PIN_CLK  0
+#define PIN_DATA 34
+#define READ_LEN (2 * 256)
+#define GAIN_FACTOR 3
+uint8_t MIC_BUFFER[READ_LEN] = {0};
+
+uint16_t oldy[160];
+int16_t *adcBuffer = NULL;
+
+void i2s_init()
+{
+  // straight copied from m5stickc example for microphone
+   i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
+    .sample_rate =  44100,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, // is fixed at 12bit, stereo, MSB
+    .channel_format = I2S_CHANNEL_FMT_ALL_RIGHT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 2,
+    .dma_buf_len = 128,
+   };
+
+   i2s_pin_config_t pin_config;
+   pin_config.bck_io_num   = I2S_PIN_NO_CHANGE;
+   pin_config.ws_io_num    = PIN_CLK;
+   pin_config.data_out_num = I2S_PIN_NO_CHANGE;
+   pin_config.data_in_num  = PIN_DATA;
+	
+   
+   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+   i2s_set_pin(I2S_NUM_0, &pin_config);
+   i2s_set_clk(I2S_NUM_0, 44100, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+}
+
 uint8_t midiPacket[] = {
    0x80,  // header
    0x80,  // timestamp, not implemented 
@@ -51,6 +90,41 @@ uint8_t midiPacket[] = {
    0x3c,  // 0x3c == 60 == middle c
    0x00   // velocity
 };
+
+// typedef struct midi_msg {
+//   uint8_t note;
+//   uint8_t pkt_buf[5];
+//   int16_t accel;
+// } midi_msg;
+
+// void set_note(midi_msg *pm, uint8_t note) {
+//   pm->note = note;
+//   pm->pkt_buf[3] = note;
+// }
+
+// midi_msg m = {
+//   .note = 1
+//   .pkt_buf = {0x80, 0x80, 0x00, 0x3c, 0x00},
+//   .accel = 1
+// };
+// midi_msg *pm = &m;
+
+// means midiPacket[3] = 11
+
+// setting MPU interrupt to be active low, open drain 
+// MPU to ESP32 for interrupting from motion
+
+// actual struct
+// midi_msg m;
+// m.pkt_buf[0] = 1;
+// sizeof(m) should equal 5 + 2 = 7 
+
+// do not delete
+// pointer to struct
+// midi_msg *pm = &m;
+// pm->pkt_buf[0] = 1;
+// sizeof(pm) should equal 4 on a 32-bit system, or 8 on a 64-bit system
+
 
 void update_screen(const char* x){
   M5.Lcd.fillScreen(BLACK);
@@ -78,14 +152,35 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
+std::string conv_data_to_char(const char* sensor, float X, float Y, float Z){
+  char x[64];
+  char y[64];
+  char z[64];
+
+  gcvt(X, 4, x);
+  gcvt(Y, 4, y);
+  gcvt(Z, 4, z);
+
+  char combined[64];
+  strcpy(combined, sensor);
+  strcat(combined, ": "); /* copy name into the new var */
+  strcat(combined, x); 
+  strcat(combined, ", "); 
+  strcat(combined, y);
+  strcat(combined, ", ");
+  strcat(combined, z);
+
+  return combined;
+}
+
 void setup() {
   M5.begin();
 
-
   Serial.begin(115200); //if before M5 init, seems to not work?
 
-
   M5.MPU6886.Init();
+
+  i2s_init();
 
   BLEDevice::init(DEVICE_NAME);
 
@@ -136,38 +231,13 @@ void setup() {
 void loop() {
   M5.MPU6886.getGyroData(&gyroX,&gyroY,&gyroZ);
   M5.MPU6886.getAccelData(&accX,&accY,&accZ);
-  
-  char gx[64];
-  char gy[64];
-  char gz[64];
 
-  gcvt(gyroX, 4, gx);
-  gcvt(gyroY, 4, gy);
-  gcvt(gyroZ, 4, gz);
+  // make easy to print to lcd strings of the accel and gyro values
+  const std::string gyro_for_lcd_str=conv_data_to_char("Gyro",gyroX,gyroY,gyroZ);
+  const char* gyro_for_lcd = gyro_for_lcd_str.c_str();
 
-  char combined_g[64];
-  strcpy(combined_g, "Gyro: "); /* copy name into the new var */
-  strcat(combined_g, gx); 
-  strcat(combined_g, ", "); 
-  strcat(combined_g, gy);
-  strcat(combined_g, ", ");
-  strcat(combined_g, gz);
-  
-  char ax[64];
-  char ay[64];
-  char az[64];
-
-  gcvt(accX, 4, ax);
-  gcvt(accY, 4, ay);
-  gcvt(accZ, 4, az);
-
-  char combined_a[64];
-  strcpy(combined_a, "Accel: "); /* copy name into the new var */
-  strcat(combined_a, ax); 
-  strcat(combined_a, ", "); 
-  strcat(combined_a, ay);
-  strcat(combined_a, ", ");
-  strcat(combined_a, az);
+  const std::string accel_for_lcd_str=conv_data_to_char("Accel",accX,accY,accZ);
+  const char* accel_for_lcd = accel_for_lcd_str.c_str();
 
   if (deviceConnected) { 
     sample_count++;
@@ -217,27 +287,20 @@ void loop() {
       gyro_scaled = 127; //im lazy and the max value for velocity in midi is 127. 
     }
 
-    if (SERIAL_TOGGLE){
-      printf("Acc: %d, Gyro: %d, Gyro Avg: %f, Gyro Max: %f, gyroMax/gyroAvg: %f, gyroX/gyroMax: %f  \r\n",acc_scaled,gyro_scaled,gyroAvg,gyroMax,((gyroMax/gyroAvg)-1),(abs(gyroX)/gyroMax));
-    }
+    printf("Acc: %d, Gyro: %d, Gyro Avg: %f, Gyro Max: %f, gyroMax/gyroAvg: %f, gyroX/gyroMax: %f  \r\n",acc_scaled,gyro_scaled,gyroAvg,gyroMax,((gyroMax/gyroAvg)-1),(abs(gyroX)/gyroMax));
 
     if (USE_SENSOR == 1){
       // append sample count to screen
-      strcat(combined_a, ". sample: ");
-      char sc_str[64];
-      sprintf(sc_str, "%d", sample_count);
-      strcat(combined_a, sc_str);
-      update_screen(combined_a);
+      char msg[64];
+      sprintf(msg, "%s . sample: %d", accel_for_lcd,sample_count);
+      update_screen(msg);
       midiPacket[3] = acc_scaled; // note
       midiPacket[4] = gyro_scaled;  // velocity
     }
     else if (USE_SENSOR == 2){
-      update_screen(combined_g);
+      update_screen(gyro_for_lcd);
       midiPacket[3] = gyro_scaled; // note
       midiPacket[4] = acc_scaled;  // velocity
-      if (SERIAL_TOGGLE){
-        Serial.println("connected, g");
-      }
     }
     else{
       char msg[64];
@@ -268,18 +331,14 @@ void loop() {
 
   else if (!digitalRead(side_button)){
     USE_SENSOR = 2;
-    update_screen(combined_g);
-    if (SERIAL_TOGGLE){
-      Serial.println("side_button");
-    }
+    update_screen(gyro_for_lcd);
+    Serial.println("side_button");
   }
 
   else if (!digitalRead(front_button)){
     USE_SENSOR = 1;
-    update_screen(combined_a);
-    if (SERIAL_TOGGLE){
-      Serial.println("front_button");
-    }
+    update_screen(accel_for_lcd);
+    Serial.println("front_button");
   }
 
   delay(100);
